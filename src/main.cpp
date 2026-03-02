@@ -1,13 +1,15 @@
 #include "../include/torrent_file.h"
+#include "../include/torrent_tracker.h"
+#include "thread_pool.h"
+#include "byte_tools.h"
+#include <fcntl.h>
+#include "piece_manager.h"
+#include <sys/eventfd.h>
+#include <liburing.h>
 #include <iostream>
-#include <filesystem>
 #include <random>
-#include <thread>
-#include <set>
-
-namespace fs = std::filesystem;
-
-std::mutex cerrMutex, coutMutex, peersMutex;
+#include <list>
+#include <fstream>
 
 // ------------------------generating our id-----------------------------------------
 std::string RandomString(size_t length) {
@@ -25,165 +27,268 @@ std::string RandomString(size_t length) {
 
 const std::string PeerId = "-PTK001-" + RandomString(12);
 
+std::array<uint8_t, SEND_MAX_BYTES> GetHandshakeMessage(const TorrentFile &tf, std::string_view peerId) {
+    std::array<uint8_t, SEND_MAX_BYTES> ans{};
+    ans[0] = 19;
+    for (int i = 1; i < 28; ++i) ans[i] = "BitTorrent protocol\0\0\0\0\0\0\0\0"[i - 1];
+    for (int i = 28; i < 48; ++i) ans[i] = tf.infoHash[i - 28];
+    for (int i = 48; i < 68; ++i) ans[i] = peerId[i - 48];
+    return ans;
+}
+
 //---------------------------check hash----------------------------------------------
 
-void CheckDownloadedPiecesIntegrity(const std::filesystem::path &outputFilename, const TorrentFile &tf,
-                                    PieceStorage &pieces) {
-    pieces.CloseOutputFile();
-
-    if (pieces.GetPiecesSavedToDiscIndices().size() != pieces.PiecesSavedToDiscCount()) {
-        throw std::runtime_error("Cannot determine real amount of saved pieces");
+void CheckDownloadedFile(const std::string &filepath, const TorrentFile &tf) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for integrity check: " + filepath << std::endl;
+        return;
     }
 
-    std::vector<size_t> pieceIndices = pieces.GetPiecesSavedToDiscIndices();
-    std::sort(pieceIndices.begin(), pieceIndices.end());
+    size_t total_bytes_to_download = tf.length;
+    size_t pieces_to_check = (total_bytes_to_download + tf.pieceLength - 1) / tf.pieceLength;
+    if (pieces_to_check > tf.pieceHashes.size()) pieces_to_check = tf.pieceHashes.size();
 
-    std::ifstream file(outputFilename, std::ios_base::binary);
-    for (size_t pieceIndex: pieceIndices) {
-        const std::streamoff positionInFile = pieceIndex * tf.pieceLength;
-        file.seekg(positionInFile);
-        if (!file.good()) {
-            throw std::runtime_error("Cannot read from file");
+    bool allValid = true;
+    std::vector<uint8_t> buffer(tf.pieceLength);
+
+    for (size_t i = 0; i < pieces_to_check; ++i) {
+        int pieceSize = static_cast<int>(std::min(tf.length - i * tf.pieceLength, tf.pieceLength));
+
+        file.read(reinterpret_cast<char *>(buffer.data()), pieceSize);
+        if (!file) {
+            std::cerr << "Failed to read piece " + std::to_string(i) + " from file" << std::endl;
+            return;
         }
-        std::string pieceDataFromFile(tf.pieceLength, '\0');
-        file.read(pieceDataFromFile.data(), tf.pieceLength);
-        const size_t readBytesCount = file.gcount();
-        pieceDataFromFile.resize(readBytesCount);
-        const std::string realHash = CalculateSHA1(pieceDataFromFile);
 
-        if (realHash != tf.pieceHashes[pieceIndex]) {
-            std::cerr << "File piece with index " << pieceIndex << " started at position " << positionInFile <<
-                      " with length " << pieceDataFromFile.length() << " has wrong hash " << HexEncode(realHash) <<
-                      ". Expected hash is " << HexEncode(tf.pieceHashes[pieceIndex]) << std::endl;
-            throw std::runtime_error("Wrong piece hash");
+        std::vector<uint8_t> pieceData(buffer.begin(), buffer.begin() + pieceSize);
+        auto hash = CalculateSHA1(pieceData);
+
+        bool pieceOk = true;
+        for (int j = 0; j < 20; ++j)
+            if (hash[j] != static_cast<uint8_t>(tf.pieceHashes[i][j])) {
+                pieceOk = false;
+                break;
+            }
+
+        if (!pieceOk) {
+            allValid = false;
+            std::cerr << "Piece " << i << " is corrupted!" << std::endl;
         }
     }
+
+    file.close();
+    if (allValid) std::cout << "All downloaded pieces are valid." << std::endl;
+    else std::cerr << "Some pieces are corrupted." << std::endl;
 }
 
 //-------------------starting and downloading----------------------------------------
 
-std::vector<std::thread> peerThreads;
-std::vector<std::shared_ptr<PeerConnect>> peerConnections;
-std::set<std::string> connectedPeers;
+std::list<std::array<uint8_t, PEER_MEMORY_SIZE>> peersMemory;
+std::list<PeerConnection> peersHandlers;
 
-void StartNewPeerThreads(PieceStorage &pieces, const TorrentFile &torrentFile,
-                         const std::string &ourId, const TorrentTracker &tracker) {
-    const std::vector<Peer> &peers = tracker.GetPeers();
-
-    std::lock_guard<std::mutex> lock(peersMutex);
-    for (const auto &peer: peers) {
-        std::string peerKey = peer.ip + ":" + std::to_string(peer.port);
-        if (!connectedPeers.contains(peerKey)) {
-            std::cout << "New peer found: " << peerKey << std::endl;
-            const auto peerConnectPtr = std::make_shared<PeerConnect>(peer, torrentFile, ourId, pieces);
-            peerConnections.emplace_back(peerConnectPtr);
-            peerThreads.emplace_back([peerConnectPtr, peerKey]() {
-                int attempts = 0;
-                while (attempts < 3 && !peerConnectPtr->IsTerminated()) {
-                    try {
-                        ++attempts;
-                        peerConnectPtr->Run();
-                    } catch (const std::runtime_error &e) {
-                        std::lock_guard<std::mutex> cerrLock(cerrMutex);
-                        std::cerr << "Runtime error: " << e.what() << std::endl;
-                    } catch (const std::exception &e) {
-                        std::lock_guard<std::mutex> cerrLock(cerrMutex);
-                        std::cerr << "Exception: " << e.what() << std::endl;
-                    } catch (...) {
-                        std::lock_guard<std::mutex> cerrLock(cerrMutex);
-                        std::cerr << "Unknown error" << std::endl;
-                    }
-                    if (peerConnectPtr->Failed()) break;
-                }
-
-                std::lock_guard<std::mutex> lock(peersMutex);
-                connectedPeers.erase(peerKey);
-            });
-            connectedPeers.emplace(peerKey);
+void FreeClosedConnection() {
+    auto handlers_it = peersHandlers.begin();
+    auto memory_it = peersMemory.begin();
+    while (handlers_it != peersHandlers.end()) {
+        if (handlers_it->IsClosed()) {
+            peersHandlers.erase(handlers_it);
+            peersMemory.erase(memory_it);
+            return;
         }
+        ++handlers_it;
+        ++memory_it;
     }
 }
 
 
-void DownloadTorrentFile(const TorrentFile &torrentFile, PieceStorage &pieces, const std::string &ourId) {
-    using namespace std::chrono_literals;
-    std::cout << "Connecting to tracker " << torrentFile.announce << std::endl;
+void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &downloadDir) {
+    //Prepare eventfd_ctx
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd < 0) throw std::runtime_error("Failed to create eventfd");
+    IoContext eventfd_ctx;
+    eventfd_ctx.peer_connection_ = nullptr;
+    eventfd_ctx.target_ = IoContext::THREADS;
+    eventfd_ctx.op_ = IoContext::READ;
+    uint64_t eventfd_buffer = 0;
+
+    //Init io_uring;
+    struct io_uring ring{};
+    io_uring_queue_init(1024, &ring, 0);
+
+    //Init thread pool
+    std::mutex out_mutex;
+    std::queue<HashResult> hash_results;
+    ThreadPool threadPool(15);
+    PieceManager pieceManager(torrentFile, out_mutex, hash_results, threadPool);
+
+    //Update Peers
     TorrentTracker tracker(torrentFile.announce);
-    const size_t piecesToDownload = pieces.TotalPiecesCount();
+    tracker.UpdatePeers(torrentFile, PeerId, 6881);
+//    int64_t peersUpdateInterval = tracker.UpdatePeers(torrentFile, PeerId, 6881);
 
-    auto prev_time_updated_peers = std::chrono::steady_clock::now();
-    int64_t interval_for_update = 0;
+    for (const Peer &peer: tracker.GetPeers()) {
+        //Create "Connections handlers"
+        peersMemory.emplace_back();
+        peersHandlers.emplace_back(peer, peersMemory.back(), pieceManager);
 
-    while (pieces.PiecesSavedToDiscCount() < piecesToDownload) {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - prev_time_updated_peers).count();
-
-        if (pieces.PiecesInProgressCount() == 0 || elapsed >= interval_for_update) {
-            try {
-                std::cout << "Updating peers from tracker..." << std::endl;
-
-                size_t downloaded_bytes =
-                        static_cast<size_t>(pieces.PiecesSavedToDiscCount()) * torrentFile.pieceLength;
-                downloaded_bytes = std::min(downloaded_bytes, torrentFile.length);
-                interval_for_update = tracker.UpdatePeers(torrentFile, ourId, 6881, downloaded_bytes);
-                std::cout << "New interval: " << interval_for_update << std::endl;
-
-                prev_time_updated_peers = std::chrono::steady_clock::now();
-
-                StartNewPeerThreads(pieces, torrentFile, ourId, tracker);
-            } catch (const std::exception &e) {
-                std::cerr << "Tracker update failed: " << e.what() << std::endl;
-                if (interval_for_update == 0) {
-                    std::cout << "Trying 1 more time in 30s" << std::endl;
-                    interval_for_update = 30;
-                    std::this_thread::sleep_for(10s);
-                } else {
-                    std::cerr << "No peers found. Cannot download a file" << std::endl;
-                    throw std::runtime_error("No peers available");
-                }
-            }
+        //Try to connect with each handler
+        try {
+            peersHandlers.back().StartConnection(&ring);
+        } catch (std::runtime_error &e) {
+            peersMemory.pop_back();
+            peersHandlers.pop_back();
+            std::cout << e.what() << std::endl;
         }
-
-        {
-            std::lock_guard<std::mutex> lock(coutMutex);
-            std::cout << "Progress: " << pieces.PiecesSavedToDiscCount() << "/" << piecesToDownload
-                      << " pieces. Active threads: " << peerThreads.size() << std::endl;
-        }
-
-        std::this_thread::sleep_for(1s);
     }
 
-    std::cout << "Download finished. Terminating threads..." << std::endl;
-    for (auto &conn: peerConnections) conn->Terminate();
-    for (auto &t: peerThreads) if (t.joinable()) t.join();
+    io_uring_submit(&ring);
+
+    const std::array<uint8_t, SEND_MAX_BYTES> handshake_message(GetHandshakeMessage(torrentFile, PeerId));
+    std::cout << "Initial peers: " << peersHandlers.size() << std::endl;
+
+    //Send eventfd to ring
+    {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        io_uring_prep_read(sqe, efd, &eventfd_buffer, sizeof(eventfd_buffer), 0);
+        io_uring_sqe_set_data(sqe, &eventfd_ctx);
+        io_uring_submit(&ring);
+    }
+
+    //Prepare file
+    int file_fd = open(downloadDir.data(), O_WRONLY | O_CREAT, 0666);
+    if (file_fd < 0) {
+        throw std::runtime_error("Failed to open file for writing! Check permissions.");
+    }
+    //Listening cycle
+    while (!pieceManager.FinishedDownloading()) {
+        struct io_uring_cqe *cqe;
+        int ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) continue;
+
+        int connect_result = cqe->res;
+        auto *data = static_cast<IoContext *>(io_uring_cqe_get_data(cqe));
+
+        if (data->target_ == IoContext::DISC) {
+//            std::cout << "Successfully saved piece to disk!" << std::endl;
+            std::cout << "Total saved: " << pieceManager.SavedCount() << " / " << pieceManager.TotalPiecesToDownload()
+                      << std::endl;
+            pieceManager.SetSaved(data->piece_index);
+            delete data;
+            io_uring_cqe_seen(&ring, cqe);
+            continue;
+        }
+
+        if (data->target_ == IoContext::THREADS) {
+            std::queue<HashResult> ready;
+            {
+                std::lock_guard<std::mutex> lock(out_mutex);
+                std::swap(ready, hash_results);
+            }
+            while (!ready.empty()) {
+//                std::cout << "Piece: " << ready.front().piece_index_ << " "
+//                          << (ready.front().is_valid_ ? "valid" : "INVALID") << std::endl;
+                if (ready.front().is_valid_) {
+                    pieceManager.SetDownloaded(ready.front().piece_index_);
+                    uint64_t file_offset = ready.front().piece_index_ * torrentFile.pieceLength;
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+                    const std::vector<uint8_t> &buffer = pieceManager.GetPieceById(
+                            ready.front().piece_index_).piece_data_;
+
+                    auto *ctx = new IoContext();
+                    ctx->target_ = IoContext::DISC;
+                    ctx->op_ = IoContext::WRITE;
+                    ctx->piece_index = ready.front().piece_index_;
+
+                    io_uring_prep_write(sqe, file_fd, buffer.data(), buffer.size(), file_offset);
+                    io_uring_sqe_set_data(sqe, ctx);
+                    io_uring_submit(&ring);
+                } else pieceManager.ResetPiece(ready.front().piece_index_);
+                ready.pop();
+            }
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            io_uring_prep_read(sqe, efd, &eventfd_buffer, sizeof(eventfd_buffer), 0);
+            io_uring_sqe_set_data(sqe, &eventfd_ctx);
+            io_uring_submit(&ring);
+
+            io_uring_cqe_seen(&ring, cqe);
+            continue;
+        }
+
+        if (data->peer_connection_->IsClosed()) {
+            std::cerr << "Operation on closed handler!" << std::endl;
+            io_uring_cqe_seen(&ring, cqe);
+            continue;
+        }
+
+        switch (data->op_) {
+            case IoContext::CONNECT: {
+                if (connect_result == 0) {
+                    std::cout << "Successfully connected to " << data->peer_connection_->GetIp() << ":"
+                              << data->peer_connection_->GetPort() << std::endl;
+                    //Send Handshake
+                    data->peer_connection_->SendAndReceiveHandshake(&ring, handshake_message);
+                } else {
+                    std::cerr << "Connection failed: " << connect_result << std::endl;
+                    //Erase closed connection
+                    data->peer_connection_->Close();
+                }
+                break;
+            }
+            case IoContext::READ : {
+                if (connect_result <= 0) {
+                    std::cerr << "Connection closed / connection error" << std::endl;
+                    data->peer_connection_->Close();
+                    break;
+                }
+
+                if (data->peer_connection_->GetState() == PeerConnection::HANDSHAKING)
+                    data->peer_connection_->CheckHandshakeMessage(handshake_message, connect_result, &ring, efd);
+                else
+                    data->peer_connection_->ReceiveMessage(&ring, connect_result, efd);
+                break;
+            }
+            case IoContext::WRITE: {
+                if (connect_result <= 0) {
+                    data->peer_connection_->Close();
+                } else {
+                    data->peer_connection_->OnSendCompleted(&ring, connect_result);
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+
+        io_uring_cqe_seen(&ring, cqe);
+    }
+
+    for (auto &i: peersHandlers) i.Close();
+    close(file_fd);
+
+    io_uring_queue_exit(&ring);
 }
 
 
+//-----------------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
     std::string download_dir = ".";
-    int percent = 100;
     std::string torrent_file_path;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-d" && i + 1 < argc) {
             download_dir = argv[++i];
-        } else if (arg == "-p" && i + 1 < argc) {
-            percent = std::stoi(argv[++i]);
-            if (percent < 1 || percent > 100) {
-                std::cerr << "Invalid percentage" << std::endl;
-                return 1;
-            }
         } else {
             torrent_file_path = arg;
         }
     }
 
     if (torrent_file_path.empty()) {
-        std::cerr << "-d <download_dir> -p <percent> <torrent_file>" << std::endl;
+        std::cerr << "-d <download_dir> <torrent_file>" << std::endl;
         return 1;
     }
-
 
     try {
         TorrentFile torrentFile;
@@ -191,15 +296,10 @@ int main(int argc, char *argv[]) {
         torrentFile = LoadTorrentFile(torrent_file_path);
         std::cout << "Loaded torrent file " << torrentFile.name << ". " << torrentFile.comment << std::endl;
 
-        PieceStorage pieces(torrentFile, download_dir, percent);
+        std::string downloadDir = download_dir + "/" + torrentFile.name;
 
-        DownloadTorrentFile(torrentFile, pieces, PeerId);
-
-        fs::path outputFile = fs::path(download_dir) / torrentFile.name;
-        CheckDownloadedPiecesIntegrity(outputFile, torrentFile, pieces);
-
-        std::cout << "Successfully downloaded " << pieces.PiecesSavedToDiscCount()
-                  << " pieces and verified integrity" << std::endl;
+        DownloadTorrentFile(torrentFile, downloadDir);
+        CheckDownloadedFile(downloadDir, torrentFile);
 
     } catch (const std::exception &e) {
         std::cerr << "Error: " << e.what() << std::endl;
