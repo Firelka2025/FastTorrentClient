@@ -40,7 +40,8 @@ PieceManager::PieceManager(const TorrentFile &tf, std::mutex &mutex, std::queue<
 
     random_piece_order_.resize(pieces_.size());
     std::iota(random_piece_order_.begin(), random_piece_order_.end(), 0);
-    std::mt19937 g(42);
+    std::random_device device;
+    std::mt19937 g(device());
     std::shuffle(random_piece_order_.begin(), random_piece_order_.end(), g);
 }
 
@@ -114,7 +115,10 @@ void PieceManager::CheckDownload(size_t id, int efd) {
             hash_results.emplace(id, ans);
         }
         uint64_t msg = 1;
-        write(efd, &msg, sizeof(msg));
+        uint8_t cnt_er = 0;
+        do {
+            if (write(efd, &msg, sizeof(msg)) != -1) break;
+        } while (++cnt_er < 5);
     });
 }
 

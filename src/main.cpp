@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include "piece_manager.h"
 #include <sys/eventfd.h>
+#include "config.h"
 #include <liburing.h>
 #include <iostream>
 #include <random>
@@ -104,8 +105,9 @@ void FreeClosedConnection() {
 
 void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &downloadDir) {
     //Prepare eventfd_ctx
-    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    const int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (efd < 0) throw std::runtime_error("Failed to create eventfd");
+
     IoContext eventfd_ctx;
     eventfd_ctx.peer_connection_ = nullptr;
     eventfd_ctx.target_ = IoContext::THREADS;
@@ -113,8 +115,7 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
     uint64_t eventfd_buffer = 0;
 
     //Init io_uring;
-    struct io_uring ring{};
-    io_uring_queue_init(1024, &ring, 0);
+    io_uring_queue_init(1024, &main_ring, 0);
 
     //Init thread pool
     std::mutex out_mutex;
@@ -134,7 +135,7 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
 
         //Try to connect with each handler
         try {
-            peersHandlers.back().StartConnection(&ring);
+            peersHandlers.back().StartConnection();
         } catch (std::runtime_error &e) {
             peersMemory.pop_back();
             peersHandlers.pop_back();
@@ -142,17 +143,17 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
         }
     }
 
-    io_uring_submit(&ring);
+    prepare_io_uring_pack();
 
     const std::array<uint8_t, SEND_MAX_BYTES> handshake_message(GetHandshakeMessage(torrentFile, PeerId));
     std::cout << "Initial peers: " << peersHandlers.size() << std::endl;
 
-    //Send eventfd to ring
+    //Send eventfd to main_ring
     {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
         io_uring_prep_read(sqe, efd, &eventfd_buffer, sizeof(eventfd_buffer), 0);
         io_uring_sqe_set_data(sqe, &eventfd_ctx);
-        io_uring_submit(&ring);
+        prepare_io_uring_pack();
     }
 
     //Prepare file
@@ -163,19 +164,25 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
     //Listening cycle
     while (!pieceManager.FinishedDownloading()) {
         struct io_uring_cqe *cqe;
-        int ret = io_uring_wait_cqe(&ring, &cqe);
-        if (ret < 0) continue;
+        struct __kernel_timespec ts = {.tv_sec = 0, .tv_nsec = 5'000'000};
+        int ret = io_uring_wait_cqe_timeout(&main_ring, &cqe, &ts);
+        if (ret < 0) {
+            prepare_io_uring_pack(true);
+            continue;
+        }
 
         int connect_result = cqe->res;
         auto *data = static_cast<IoContext *>(io_uring_cqe_get_data(cqe));
 
         if (data->target_ == IoContext::DISC) {
-//            std::cout << "Successfully saved piece to disk!" << std::endl;
-            std::cout << "Total saved: " << pieceManager.SavedCount() << " / " << pieceManager.TotalPiecesToDownload()
-                      << std::endl;
+            if (pieceManager.SavedCount() % 100 == 0)
+                std::cout << "Total saved: " << pieceManager.SavedCount() << " / "
+                          << pieceManager.TotalPiecesToDownload()
+                          << std::endl;
+
             pieceManager.SetSaved(data->piece_index);
             delete data;
-            io_uring_cqe_seen(&ring, cqe);
+            io_uring_cqe_seen(&main_ring, cqe);
             continue;
         }
 
@@ -191,7 +198,7 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
                 if (ready.front().is_valid_) {
                     pieceManager.SetDownloaded(ready.front().piece_index_);
                     uint64_t file_offset = ready.front().piece_index_ * torrentFile.pieceLength;
-                    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
                     const std::vector<uint8_t> &buffer = pieceManager.GetPieceById(
                             ready.front().piece_index_).piece_data_;
 
@@ -202,22 +209,22 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
 
                     io_uring_prep_write(sqe, file_fd, buffer.data(), buffer.size(), file_offset);
                     io_uring_sqe_set_data(sqe, ctx);
-                    io_uring_submit(&ring);
+                    prepare_io_uring_pack();
                 } else pieceManager.ResetPiece(ready.front().piece_index_);
                 ready.pop();
             }
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
             io_uring_prep_read(sqe, efd, &eventfd_buffer, sizeof(eventfd_buffer), 0);
             io_uring_sqe_set_data(sqe, &eventfd_ctx);
-            io_uring_submit(&ring);
+            prepare_io_uring_pack();
 
-            io_uring_cqe_seen(&ring, cqe);
+            io_uring_cqe_seen(&main_ring, cqe);
             continue;
         }
 
         if (data->peer_connection_->IsClosed()) {
             std::cerr << "Operation on closed handler!" << std::endl;
-            io_uring_cqe_seen(&ring, cqe);
+            io_uring_cqe_seen(&main_ring, cqe);
             continue;
         }
 
@@ -227,7 +234,7 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
                     std::cout << "Successfully connected to " << data->peer_connection_->GetIp() << ":"
                               << data->peer_connection_->GetPort() << std::endl;
                     //Send Handshake
-                    data->peer_connection_->SendAndReceiveHandshake(&ring, handshake_message);
+                    data->peer_connection_->SendAndReceiveHandshake(handshake_message);
                 } else {
                     std::cerr << "Connection failed: " << connect_result << std::endl;
                     //Erase closed connection
@@ -243,16 +250,16 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
                 }
 
                 if (data->peer_connection_->GetState() == PeerConnection::HANDSHAKING)
-                    data->peer_connection_->CheckHandshakeMessage(handshake_message, connect_result, &ring, efd);
+                    data->peer_connection_->CheckHandshakeMessage(handshake_message, connect_result, efd);
                 else
-                    data->peer_connection_->ReceiveMessage(&ring, connect_result, efd);
+                    data->peer_connection_->ReceiveMessage(connect_result, efd);
                 break;
             }
             case IoContext::WRITE: {
                 if (connect_result <= 0) {
                     data->peer_connection_->Close();
                 } else {
-                    data->peer_connection_->OnSendCompleted(&ring, connect_result);
+                    data->peer_connection_->OnSendCompleted(connect_result);
                 }
                 break;
             }
@@ -261,13 +268,13 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
                 break;
         }
 
-        io_uring_cqe_seen(&ring, cqe);
+        io_uring_cqe_seen(&main_ring, cqe);
     }
 
     for (auto &i: peersHandlers) i.Close();
     close(file_fd);
 
-    io_uring_queue_exit(&ring);
+    io_uring_queue_exit(&main_ring);
 }
 
 

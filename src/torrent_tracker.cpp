@@ -1,8 +1,6 @@
 #include "../include/torrent_tracker.h"
 #include "../include/bencode.h"
-#include "../include/peer.h"
 #include <cpr/cpr.h>
-
 #include <utility>
 
 const std::vector<Peer> &TorrentTracker::GetPeers() const { return peers_; }

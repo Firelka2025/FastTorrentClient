@@ -6,10 +6,7 @@
 #include "message.h"
 #include "span"
 #include "piece_manager.h"
-
-constexpr uint RECEIVE_MAX_BYTES = 1 << 20;
-constexpr uint SEND_MAX_BYTES = 68;
-constexpr uint PEER_MEMORY_SIZE = RECEIVE_MAX_BYTES + SEND_MAX_BYTES;
+#include "config.h"
 
 struct PeerConnection;
 
@@ -36,7 +33,6 @@ struct IoContext {
     PeerConnection *peer_connection_;
     Operation op_;
     Target target_;
-    size_t expected_bytes = 0;
     uint32_t piece_index = 0;
 };
 
@@ -52,17 +48,15 @@ struct PeerConnection {
 
     ~PeerConnection();
 
-    void StartConnection(struct io_uring *ring);
+    void StartConnection();
 
-    void SendAndReceiveHandshake(struct io_uring *ring, const std::array<uint8_t, SEND_MAX_BYTES> &handshake);
+    void SendAndReceiveHandshake(const std::array<uint8_t, SEND_MAX_BYTES> &handshake);
 
-    bool
-    CheckHandshakeMessage(const std::array<uint8_t, SEND_MAX_BYTES> &handshake, int length, struct io_uring *ring,
-                          int efd);
+    bool CheckHandshakeMessage(const std::array<uint8_t, SEND_MAX_BYTES> &handshake, int length, int efd);
 
-    void ReceiveMessage(struct io_uring *ring, size_t length, int efd);
+    void ReceiveMessage(size_t length, int efd);
 
-    bool SendMessage(struct io_uring *ring, const Message &message);
+    bool SendMessage(const Message &message);
 
     [[nodiscard]] std::string_view GetIp() const;
 
@@ -72,14 +66,14 @@ struct PeerConnection {
 
     [[nodiscard]] State GetState() const;
 
-    void OnSendCompleted(struct io_uring *ring, int res);
+    void OnSendCompleted(int res);
 
     void Close();
 
 private:
-    void ProcessSendQueue(struct io_uring *ring);
+    void ProcessSendQueue();
 
-    void RequestMoreBlocks(struct io_uring *ring);
+    void RequestMoreBlocks();
 
     static constexpr size_t MAX_PIPELINE = 150;
     size_t send_offset_ = 0;

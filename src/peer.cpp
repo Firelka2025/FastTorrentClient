@@ -24,7 +24,7 @@ PeerConnection::~PeerConnection() {
     if (fd_ != -1) close(fd_);
 }
 
-void PeerConnection::StartConnection(struct io_uring *ring) {
+void PeerConnection::StartConnection() {
     if (state_ == CLOSED) {
         throw std::runtime_error("Called StartConnection on closed connection");
     }
@@ -41,33 +41,30 @@ void PeerConnection::StartConnection(struct io_uring *ring) {
     write_ctx_.op_ = IoContext::CONNECT;
     state_ = CONNECTING;
 
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
     if (!sqe) throw std::runtime_error("sqe is empty");
 
     io_uring_prep_connect(sqe, fd_, (struct sockaddr *) &addr, sizeof(addr));
     io_uring_sqe_set_data(sqe, &write_ctx_);
 }
 
-void
-PeerConnection::SendAndReceiveHandshake(struct io_uring *ring, const std::array<uint8_t, SEND_MAX_BYTES> &handshake) {
+void PeerConnection::SendAndReceiveHandshake(const std::array<uint8_t, SEND_MAX_BYTES> &handshake) {
     std::vector<uint8_t> hs_vec(handshake.begin(), handshake.end());
     send_queue_.push(std::move(hs_vec));
 
-    if (!is_sending_) ProcessSendQueue(ring);
+    if (!is_sending_) ProcessSendQueue();
 
     read_ctx_.target_ = IoContext::PEER;
     read_ctx_.op_ = IoContext::READ;
-    read_ctx_.expected_bytes = 68;
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
     io_uring_prep_recv(sqe, fd_, receive_memory_.data(), 68, 0);
     io_uring_sqe_set_data(sqe, &read_ctx_);
 
     state_ = HANDSHAKING;
-    io_uring_submit(ring);
+    prepare_io_uring_pack();
 }
 
-bool PeerConnection::CheckHandshakeMessage(const std::array<uint8_t, SEND_MAX_BYTES> &handshake, int length,
-                                           struct io_uring *ring, int efd) {
+bool PeerConnection::CheckHandshakeMessage(const std::array<uint8_t, SEND_MAX_BYTES> &handshake, int length, int efd) {
     if (length + current_offset_ >= 68) {
         for (int i = 0; i < 20; ++i)
             if (receive_memory_[i] != handshake[i]) {
@@ -86,20 +83,20 @@ bool PeerConnection::CheckHandshakeMessage(const std::array<uint8_t, SEND_MAX_BY
 
         current_offset_ = 0;
         state_ = DOWNLOADING;
-        ReceiveMessage(ring, next_message_length, efd);
+        ReceiveMessage(next_message_length, efd);
 //        std::cout << "Handshake successful" << std::endl;
         return true;
     }
 
     current_offset_ += length;
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
     io_uring_prep_recv(sqe, fd_, receive_memory_.data() + current_offset_, 68 - current_offset_, 0);
     io_uring_sqe_set_data(sqe, &read_ctx_);
-    io_uring_submit(ring);
+    prepare_io_uring_pack();
     return false;
 }
 
-void PeerConnection::ReceiveMessage(struct io_uring *ring, size_t length, int efd) {
+void PeerConnection::ReceiveMessage(size_t length, int efd) {
     while (true) {
         uint32_t message_length = 0;
         if (current_offset_ + length >= 4)
@@ -113,14 +110,13 @@ void PeerConnection::ReceiveMessage(struct io_uring *ring, size_t length, int ef
         if (current_offset_ + length < 4 || current_offset_ + length - 4 < message_length) {
             read_ctx_.target_ = IoContext::PEER;
             read_ctx_.op_ = IoContext::READ;
-            read_ctx_.expected_bytes = -1;
             current_offset_ += length;
 
-            struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
             io_uring_prep_recv(sqe, fd_, receive_memory_.data() + current_offset_, RECEIVE_MAX_BYTES - current_offset_,
                                0);
             io_uring_sqe_set_data(sqe, &read_ctx_);
-            io_uring_submit(ring);
+            prepare_io_uring_pack();
             return;
         }
 
@@ -146,7 +142,7 @@ void PeerConnection::ReceiveMessage(struct io_uring *ring, size_t length, int ef
 //                    std::cout << "We are UNCHOCKED now" << std::endl;
                     is_choked_ = false;
 
-                    RequestMoreBlocks(ring);
+                    RequestMoreBlocks();
                     break;
                 }
                 case (Message::BitField): {
@@ -158,7 +154,7 @@ void PeerConnection::ReceiveMessage(struct io_uring *ring, size_t length, int ef
                         }
                     }
                     if (!sent_interest) {
-                        SendMessage(ring, InterestedMessage);
+                        SendMessage(InterestedMessage);
                         sent_interest = true;
                     }
                     break;
@@ -171,7 +167,7 @@ void PeerConnection::ReceiveMessage(struct io_uring *ring, size_t length, int ef
                         }
                     }
                     if (!sent_interest) {
-                        SendMessage(ring, InterestedMessage);
+                        SendMessage(InterestedMessage);
                         sent_interest = true;
                     }
                     break;
@@ -200,7 +196,7 @@ void PeerConnection::ReceiveMessage(struct io_uring *ring, size_t length, int ef
                         cur_piece.FillDownloaded(begin, data);
                         if (cur_piece.IsDownloaded()) pieceManager_.CheckDownload(index, efd);
                     }
-                    RequestMoreBlocks(ring);
+                    RequestMoreBlocks();
                     break;
                 }
             }
@@ -214,14 +210,14 @@ void PeerConnection::ReceiveMessage(struct io_uring *ring, size_t length, int ef
     }
 }
 
-bool PeerConnection::SendMessage(struct io_uring *ring, const Message &message) {
+bool PeerConnection::SendMessage(const Message &message) {
     std::vector<uint8_t> buffer(message.GetMessageLength());
     std::span<uint8_t> span_buf(buffer);
     message.PrepareMemToSend(span_buf);
 
     send_queue_.push(std::move(buffer));
 
-    if (!is_sending_) ProcessSendQueue(ring);
+    if (!is_sending_) ProcessSendQueue();
 
     return true;
 }
@@ -246,7 +242,7 @@ bool PeerConnection::IsClosed() const { return state_ == CLOSED; }
 
 PeerConnection::State PeerConnection::GetState() const { return state_; }
 
-void PeerConnection::OnSendCompleted(struct io_uring *ring, int res) {
+void PeerConnection::OnSendCompleted(int res) {
     if (res <= 0) {
         Close();
         return;
@@ -259,10 +255,10 @@ void PeerConnection::OnSendCompleted(struct io_uring *ring, int res) {
         send_offset_ = 0;
     }
 
-    ProcessSendQueue(ring);
+    ProcessSendQueue();
 }
 
-void PeerConnection::ProcessSendQueue(struct io_uring *ring) {
+void PeerConnection::ProcessSendQueue() {
     if (send_queue_.empty()) {
         is_sending_ = false;
         return;
@@ -272,18 +268,16 @@ void PeerConnection::ProcessSendQueue(struct io_uring *ring) {
     const auto &buffer = send_queue_.front();
     write_ctx_.target_ = IoContext::PEER;
     write_ctx_.op_ = IoContext::WRITE;
-    write_ctx_.expected_bytes = buffer.size();
 
     size_t bytes_to_send = buffer.size() - send_offset_;
-    write_ctx_.expected_bytes = bytes_to_send;
 
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
     io_uring_prep_send(sqe, fd_, buffer.data() + send_offset_, bytes_to_send, 0);
     io_uring_sqe_set_data(sqe, &write_ctx_);
-    io_uring_submit(ring);
+    prepare_io_uring_pack();
 }
 
-void PeerConnection::RequestMoreBlocks(struct io_uring *ring) {
+void PeerConnection::RequestMoreBlocks() {
     if (is_choked_) return;
 
     while (active_requests_.size() < MAX_PIPELINE) {
@@ -291,7 +285,7 @@ void PeerConnection::RequestMoreBlocks(struct io_uring *ring) {
         if (next_block.index_ == uint32_t(-1)) break;
 
         active_requests_.push_back(next_block);
-        SendMessage(ring, next_block.GetRequestMessage());
+        SendMessage(next_block.GetRequestMessage());
     }
 }
 

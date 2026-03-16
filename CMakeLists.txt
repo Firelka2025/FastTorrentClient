@@ -32,7 +32,9 @@ add_executable(FastTorrentClient src/main.cpp
         include/piece_manager.h
         src/piece_manager.cpp
         include/thread_pool.h
-        src/thread_pool.cpp)
+        src/thread_pool.cpp
+        include/config.h
+        src/config.cpp)
 
 target_include_directories(FastTorrentClient PRIVATE include)
 
