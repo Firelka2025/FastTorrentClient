@@ -4,9 +4,10 @@
 #include <liburing.h>
 #include "chrono"
 
-constexpr uint RECEIVE_MAX_BYTES{1 << 20};
+constexpr uint RECEIVE_MAX_BYTES{1 << 19};
 constexpr uint SEND_MAX_BYTES{68};
 constexpr uint PEER_MEMORY_SIZE{RECEIVE_MAX_BYTES + SEND_MAX_BYTES};
+constexpr size_t SEND_BUFFER_RESERVE{1 << 16};
 
 
 constexpr uint io_uring_min_queries_req{32};

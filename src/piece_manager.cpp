@@ -38,11 +38,11 @@ PieceManager::PieceManager(const TorrentFile &tf, std::mutex &mutex, std::queue<
 
     if (last_piece_size) pieces_.emplace_back(total_pieces, last_piece_size);
 
-    random_piece_order_.resize(pieces_.size());
-    std::iota(random_piece_order_.begin(), random_piece_order_.end(), 0);
+    missing_pieces_.resize(pieces_.size());
+    std::iota(missing_pieces_.begin(), missing_pieces_.end(), 0);
     std::random_device device;
     std::mt19937 g(device());
-    std::shuffle(random_piece_order_.begin(), random_piece_order_.end(), g);
+    std::shuffle(missing_pieces_.begin(), missing_pieces_.end(), g);
 }
 
 Block PieceManager::GetNextBlockToDownload(const std::vector<bool> &peer_bitfield, uint32_t &preferred_piece,
@@ -55,21 +55,27 @@ Block PieceManager::GetNextBlockToDownload(const std::vector<bool> &peer_bitfiel
         }
     }
 
-    for (uint32_t i: random_piece_order_) {
-        if (peer_bitfield[i] && pieces_[i].state_ == Piece::DOWNLOADING && !pieces_[i].not_downloaded_begins_.empty()) {
+    for (uint32_t i: downloading_pieces_) {
+        if (peer_bitfield[i] && !pieces_[i].not_downloaded_begins_.empty()) {
             preferred_piece = i;
             return pieces_[i].GetNextBlock();
         }
     }
 
-    for (uint32_t i: random_piece_order_) {
-        if (peer_bitfield[i] && pieces_[i].state_ == Piece::MISSING && !pieces_[i].not_downloaded_begins_.empty()) {
-            preferred_piece = i;
-            return pieces_[i].GetNextBlock();
+    for (size_t i = 0; i < missing_pieces_.size(); ++i) {
+        uint32_t val = missing_pieces_[i];
+        if (peer_bitfield[val]) {
+            downloading_pieces_.push_back(val);
+
+            std::swap(missing_pieces_[i], missing_pieces_.back());
+            missing_pieces_.pop_back();
+
+            preferred_piece = val;
+            return pieces_[val].GetNextBlock();
         }
     }
 
-    for (uint32_t i: random_piece_order_) {
+    for (uint32_t i: downloading_pieces_) {
         if (peer_bitfield[i] && pieces_[i].state_ == Piece::DOWNLOADING) {
             for (size_t b = 0; b < pieces_[i].downloaded_.size(); ++b) {
                 if (!pieces_[i].downloaded_[b]) {
@@ -128,6 +134,12 @@ void PieceManager::SetDownloaded(size_t id) {
         return;
     }
     pieces_[id].state_ = Piece::DOWNLOADED;
+
+    auto it = std::find(downloading_pieces_.begin(), downloading_pieces_.end(), id);
+    if (it != downloading_pieces_.end()) {
+        std::swap(*it, downloading_pieces_.back());
+        downloading_pieces_.pop_back();
+    }
 }
 
 void PieceManager::ResetPiece(size_t id) {
@@ -136,6 +148,15 @@ void PieceManager::ResetPiece(size_t id) {
         return;
     }
     pieces_[id].ResetPiece();
+
+    auto it = std::find(downloading_pieces_.begin(), downloading_pieces_.end(), id);
+    if (it != downloading_pieces_.end()) {
+        std::swap(*it, downloading_pieces_.back());
+        downloading_pieces_.pop_back();
+    }
+
+    if (std::find(missing_pieces_.begin(), missing_pieces_.end(), id) == missing_pieces_.end())
+        missing_pieces_.push_back(id);
 }
 
 void PieceManager::SetSaved(size_t id) {

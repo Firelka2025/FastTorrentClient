@@ -77,7 +77,8 @@ public:
     [[nodiscard]] size_t TotalPiecesToDownload() const;
 
 private:
-    std::vector<uint32_t> random_piece_order_;
+    std::vector<uint32_t> missing_pieces_;
+    std::vector<uint32_t> downloading_pieces_;
     size_t downloaded_pieces = 0;
     const TorrentFile &tf_;
     std::vector<Piece> pieces_;

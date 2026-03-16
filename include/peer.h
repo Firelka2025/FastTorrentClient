@@ -78,7 +78,8 @@ private:
     static constexpr size_t MAX_PIPELINE = 150;
     size_t send_offset_ = 0;
     uint32_t preferred_piece_ = uint32_t(-1);
-    std::queue<std::vector<uint8_t>> send_queue_;
+    std::vector<uint8_t> sending_buffer_;
+    std::vector<uint8_t> pending_buffer_;
     bool is_sending_ = false;
     std::vector<Block> active_requests_;
     int fd_ = -1;

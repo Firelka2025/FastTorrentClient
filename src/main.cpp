@@ -85,22 +85,22 @@ void CheckDownloadedFile(const std::string &filepath, const TorrentFile &tf) {
 
 //-------------------starting and downloading----------------------------------------
 
-std::list<std::array<uint8_t, PEER_MEMORY_SIZE>> peersMemory;
-std::list<PeerConnection> peersHandlers;
+std::deque<std::array<uint8_t, PEER_MEMORY_SIZE>> peersMemory;
+std::deque<PeerConnection> peersHandlers;
 
-void FreeClosedConnection() {
-    auto handlers_it = peersHandlers.begin();
-    auto memory_it = peersMemory.begin();
-    while (handlers_it != peersHandlers.end()) {
-        if (handlers_it->IsClosed()) {
-            peersHandlers.erase(handlers_it);
-            peersMemory.erase(memory_it);
-            return;
-        }
-        ++handlers_it;
-        ++memory_it;
-    }
-}
+//void FreeClosedConnection() {
+//    auto handlers_it = peersHandlers.begin();
+//    auto memory_it = peersMemory.begin();
+//    while (handlers_it != peersHandlers.end()) {
+//        if (handlers_it->IsClosed()) {
+//            peersHandlers.erase(handlers_it);
+//            peersMemory.erase(memory_it);
+//            return;
+//        }
+//        ++handlers_it;
+//        ++memory_it;
+//    }
+//}
 
 
 void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &downloadDir) {
@@ -158,9 +158,9 @@ void DownloadTorrentFile(const TorrentFile &torrentFile, const std::string &down
 
     //Prepare file
     int file_fd = open(downloadDir.data(), O_WRONLY | O_CREAT, 0666);
-    if (file_fd < 0) {
-        throw std::runtime_error("Failed to open file for writing! Check permissions.");
-    }
+    if (file_fd < 0) throw std::runtime_error("Failed to open file for writing! Check permissions.");
+    posix_fallocate(file_fd, 0, static_cast<long>(torrentFile.length));
+
     //Listening cycle
     while (!pieceManager.FinishedDownloading()) {
         struct io_uring_cqe *cqe;

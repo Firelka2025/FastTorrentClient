@@ -9,6 +9,7 @@
 #include "message.h"
 #include "byte_tools.h"
 #include "piece_manager.h"
+#include <netinet/tcp.h>
 
 PeerConnection::PeerConnection(Peer peer, std::array<uint8_t, PEER_MEMORY_SIZE> &mem, PieceManager &pm) :
         peer_(std::move(peer)),
@@ -18,6 +19,8 @@ PeerConnection::PeerConnection(Peer peer, std::array<uint8_t, PEER_MEMORY_SIZE> 
     read_ctx_.peer_connection_ = this;
     write_ctx_.peer_connection_ = this;
     peer_bitfield_.resize(pieceManager_.GetTotalPieces(), false);
+    sending_buffer_.reserve(SEND_BUFFER_RESERVE);
+    pending_buffer_.reserve(SEND_BUFFER_RESERVE);
 }
 
 PeerConnection::~PeerConnection() {
@@ -30,6 +33,8 @@ void PeerConnection::StartConnection() {
     }
 
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    int flag = 1;
+    setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int));
 
     //Setting sockaddr
     memset(&addr, 0, sizeof(addr));
@@ -49,8 +54,7 @@ void PeerConnection::StartConnection() {
 }
 
 void PeerConnection::SendAndReceiveHandshake(const std::array<uint8_t, SEND_MAX_BYTES> &handshake) {
-    std::vector<uint8_t> hs_vec(handshake.begin(), handshake.end());
-    send_queue_.push(std::move(hs_vec));
+    pending_buffer_.insert(pending_buffer_.end(), handshake.begin(), handshake.end());
 
     if (!is_sending_) ProcessSendQueue();
 
@@ -97,35 +101,26 @@ bool PeerConnection::CheckHandshakeMessage(const std::array<uint8_t, SEND_MAX_BY
 }
 
 void PeerConnection::ReceiveMessage(size_t length, int efd) {
-    while (true) {
-        uint32_t message_length = 0;
-        if (current_offset_ + length >= 4)
-            message_length = BytesToInt(std::span<uint8_t>(receive_memory_.data(), 4));
+    size_t total_bytes = current_offset_ + length;
+    size_t parsed_bytes = 0;
+
+    while (total_bytes - parsed_bytes >= 4) {
+        uint32_t message_length = BytesToInt(std::span<uint8_t>(receive_memory_.data() + parsed_bytes, 4));
+
         if (message_length > RECEIVE_MAX_BYTES) {
             std::cerr << "Zlovredniy peer sent big message" << std::endl;
             Close();
             return;
         }
-
-        if (current_offset_ + length < 4 || current_offset_ + length - 4 < message_length) {
-            read_ctx_.target_ = IoContext::PEER;
-            read_ctx_.op_ = IoContext::READ;
-            current_offset_ += length;
-
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
-            io_uring_prep_recv(sqe, fd_, receive_memory_.data() + current_offset_, RECEIVE_MAX_BYTES - current_offset_,
-                               0);
-            io_uring_sqe_set_data(sqe, &read_ctx_);
-            prepare_io_uring_pack();
-            return;
-        }
+        if (total_bytes - parsed_bytes < 4 + message_length) break;
 
 
         if (message_length == 0) {
-            Message message(Message::KeepAlive, std::span<uint8_t>());
+//            Message message(Message::KeepAlive, std::span<uint8_t>());
 //            std::cout << "Got KeepAlive message" << std::endl;
         } else {
-            Message message(receive_memory_[4], std::span<uint8_t>(receive_memory_.data() + 5, message_length - 1));
+            Message message(receive_memory_[parsed_bytes + 4],
+                            std::span<uint8_t>(receive_memory_.data() + parsed_bytes + 5, message_length - 1));
             switch (message.id_) {
                 case (Message::Choke): {
 //                    std::cout << "Got CHOCKED" << std::endl;
@@ -189,7 +184,10 @@ void PeerConnection::ReceiveMessage(size_t length, int efd) {
                     auto it = std::find_if(active_requests_.begin(), active_requests_.end(), [&](const Block &b) {
                         return b.index_ == index && b.begin_ == begin;
                     });
-                    if (it != active_requests_.end()) active_requests_.erase(it);
+                    if (it != active_requests_.end()) {
+                        std::swap(*it, active_requests_.back());
+                        active_requests_.pop_back();
+                    }
 
                     Piece &cur_piece = pieceManager_.GetPieceById(index);
                     if (cur_piece.state_ == Piece::DOWNLOADING) {
@@ -202,20 +200,33 @@ void PeerConnection::ReceiveMessage(size_t length, int efd) {
             }
         }
 
-        memmove(receive_memory_.data(), receive_memory_.data() + message_length + 4,
-                current_offset_ + length - 4 - message_length);
-
-        length = current_offset_ + length - 4 - message_length;
-        current_offset_ = 0;
+        parsed_bytes += 4 + message_length;
     }
+    if (state_ == CLOSED) return;
+
+    size_t remaining = total_bytes - parsed_bytes;
+
+    if (remaining > 0 && parsed_bytes > 0)
+        memmove(receive_memory_.data(), receive_memory_.data() + parsed_bytes, remaining);
+
+
+    current_offset_ = remaining;
+
+
+    read_ctx_.target_ = IoContext::PEER;
+    read_ctx_.op_ = IoContext::READ;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
+    io_uring_prep_recv(sqe, fd_, receive_memory_.data() + current_offset_, RECEIVE_MAX_BYTES - current_offset_, 0);
+    io_uring_sqe_set_data(sqe, &read_ctx_);
+    prepare_io_uring_pack();
 }
 
 bool PeerConnection::SendMessage(const Message &message) {
-    std::vector<uint8_t> buffer(message.GetMessageLength());
-    std::span<uint8_t> span_buf(buffer);
-    message.PrepareMemToSend(span_buf);
+    size_t old_size = pending_buffer_.size();
 
-    send_queue_.push(std::move(buffer));
+    pending_buffer_.resize(old_size + message.GetMessageLength());
+    std::span<uint8_t> span_buf(pending_buffer_.data() + old_size, message.GetMessageLength());
+    message.PrepareMemToSend(span_buf);
 
     if (!is_sending_) ProcessSendQueue();
 
@@ -249,30 +260,31 @@ void PeerConnection::OnSendCompleted(int res) {
     }
 
     send_offset_ += res;
-
-    if (send_offset_ == send_queue_.front().size()) {
-        send_queue_.pop();
-        send_offset_ = 0;
-    }
-
     ProcessSendQueue();
 }
 
 void PeerConnection::ProcessSendQueue() {
-    if (send_queue_.empty()) {
-        is_sending_ = false;
-        return;
+    if (send_offset_ == sending_buffer_.size()) {
+        sending_buffer_.clear();
+        send_offset_ = 0;
     }
-    is_sending_ = true;
 
-    const auto &buffer = send_queue_.front();
+    if (sending_buffer_.empty()) {
+        if (pending_buffer_.empty()) {
+            is_sending_ = false;
+            return;
+        }
+        std::swap(sending_buffer_, pending_buffer_);
+    }
+
+    is_sending_ = true;
     write_ctx_.target_ = IoContext::PEER;
     write_ctx_.op_ = IoContext::WRITE;
 
-    size_t bytes_to_send = buffer.size() - send_offset_;
+    size_t bytes_to_send = sending_buffer_.size() - send_offset_;
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&main_ring);
-    io_uring_prep_send(sqe, fd_, buffer.data() + send_offset_, bytes_to_send, 0);
+    io_uring_prep_send(sqe, fd_, sending_buffer_.data() + send_offset_, bytes_to_send, 0);
     io_uring_sqe_set_data(sqe, &write_ctx_);
     prepare_io_uring_pack();
 }
