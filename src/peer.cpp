@@ -15,10 +15,9 @@ PeerConnection::PeerConnection(Peer peer, std::array<uint8_t, PEER_MEMORY_SIZE> 
         peer_(std::move(peer)),
         receive_memory_(std::span<uint8_t>(mem.data(), RECEIVE_MAX_BYTES)),
         send_memory_(std::span<uint8_t>(mem.data() + RECEIVE_MAX_BYTES, SEND_MAX_BYTES)),
-        pieceManager_(pm) {
+        pieceManager_(pm), peer_bitfield_(pieceManager_.GetTotalPieces()) {
     read_ctx_.peer_connection_ = this;
     write_ctx_.peer_connection_ = this;
-    peer_bitfield_.resize(pieceManager_.GetTotalPieces(), false);
     sending_buffer_.reserve(SEND_BUFFER_RESERVE);
     pending_buffer_.reserve(SEND_BUFFER_RESERVE);
 }
@@ -143,8 +142,9 @@ void PeerConnection::ReceiveMessage(size_t length, int efd) {
                 case (Message::BitField): {
                     for (size_t i = 0, pos = 0; i < message.payload_.size(); ++i) {
                         for (int j = 0; j < 8; ++j) {
-                            if (pos < peer_bitfield_.size()) {
-                                peer_bitfield_[pos++] = (message.payload_[i] >> (7 - j)) & 1;
+                            if (pos < peer_bitfield_.Size()) {
+                                if ((message.payload_[i] >> (7 - j)) & 1) peer_bitfield_.Set(pos++);
+                                else peer_bitfield_.Reset(pos++);
                             }
                         }
                     }
@@ -157,8 +157,8 @@ void PeerConnection::ReceiveMessage(size_t length, int efd) {
                 case (Message::Have): {
                     if (message.payload_.size() == 4) {
                         uint32_t piece_index = BytesToInt(std::span<uint8_t>(message.payload_.data(), 4));
-                        if (piece_index < peer_bitfield_.size()) {
-                            peer_bitfield_[piece_index] = true;
+                        if (piece_index < peer_bitfield_.Size()) {
+                            peer_bitfield_.Set(piece_index);
                         }
                     }
                     if (!sent_interest) {

@@ -2,8 +2,6 @@
 
 #include <utility>
 #include <iostream>
-#include <numeric>
-#include <random>
 #include "byte_tools.h"
 
 
@@ -34,56 +32,49 @@ PieceManager::PieceManager(const TorrentFile &tf, std::mutex &mutex, std::queue<
 
     pieces_.reserve(total_pieces + (last_piece_size > 0));
     for (size_t i = 0; i < total_pieces; ++i)
-        pieces_.emplace_back(i, tf.pieceLength);
+        pieces_.emplace_back(i, tf.pieceLength, downloading_pieces_);
+    if (last_piece_size) pieces_.emplace_back(total_pieces, last_piece_size, downloading_pieces_);
 
-    if (last_piece_size) pieces_.emplace_back(total_pieces, last_piece_size);
-
-    missing_pieces_.resize(pieces_.size());
-    std::iota(missing_pieces_.begin(), missing_pieces_.end(), 0);
-    std::random_device device;
-    std::mt19937 g(device());
-    std::shuffle(missing_pieces_.begin(), missing_pieces_.end(), g);
+    downloading_pieces_.Init(pieces_.size());
+    missing_pieces_.Init(pieces_.size());
+    for (size_t i = 0; i < pieces_.size(); ++i) missing_pieces_.Set(i);
 }
 
-Block PieceManager::GetNextBlockToDownload(const std::vector<bool> &peer_bitfield, uint32_t &preferred_piece,
+Block PieceManager::GetNextBlockToDownload(const dynamic_bitset &peer_bitfield, uint32_t &preferred_piece,
                                            const std::vector<Block> &active_requests) {
     if (preferred_piece != uint32_t(-1) && preferred_piece < pieces_.size()) {
-        if (peer_bitfield[preferred_piece] &&
+        if (peer_bitfield.Peek(preferred_piece) &&
             pieces_[preferred_piece].state_ == Piece::DOWNLOADING &&
             !pieces_[preferred_piece].not_downloaded_begins_.empty()) {
             return pieces_[preferred_piece].GetNextBlock();
         }
     }
 
-    for (uint32_t i: downloading_pieces_) {
-        if (peer_bitfield[i] && !pieces_[i].not_downloaded_begins_.empty()) {
-            preferred_piece = i;
-            return pieces_[i].GetNextBlock();
-        }
+    auto pos = downloading_pieces_.GetAnyOne(peer_bitfield);
+    if (pos != downloading_pieces_.Size()) {
+        preferred_piece = pos;
+        return pieces_[pos].GetNextBlock();
     }
 
-    for (size_t i = 0; i < missing_pieces_.size(); ++i) {
-        uint32_t val = missing_pieces_[i];
-        if (peer_bitfield[val]) {
-            downloading_pieces_.push_back(val);
-
-            std::swap(missing_pieces_[i], missing_pieces_.back());
-            missing_pieces_.pop_back();
-
-            preferred_piece = val;
-            return pieces_[val].GetNextBlock();
-        }
+    pos = missing_pieces_.GetAnyOne(peer_bitfield);
+    if (pos != missing_pieces_.Size()) {
+        downloading_pieces_.Set(pos);
+        missing_pieces_.Reset(pos);
+        preferred_piece = pos;
+        return pieces_[pos].GetNextBlock();
     }
 
-    for (uint32_t i: downloading_pieces_) {
-        if (peer_bitfield[i] && pieces_[i].state_ == Piece::DOWNLOADING) {
-            for (size_t b = 0; b < pieces_[i].downloaded_.size(); ++b) {
-                if (!pieces_[i].downloaded_[b]) {
+    for (const Piece &piece: pieces_) {
+        if (piece.state_ == Piece::DOWNLOADING && piece.not_downloaded_begins_.empty() &&
+            peer_bitfield.Peek(piece.id_)) {
+
+            for (size_t b = 0; b < piece.downloaded_.size(); ++b) {
+                if (!piece.downloaded_[b]) {
                     uint32_t begin = b << 14;
 
                     bool already_requested = false;
                     for (const auto &req: active_requests) {
-                        if (req.index_ == pieces_[i].id_ && req.begin_ == begin) {
+                        if (req.index_ == piece.id_ && req.begin_ == begin) {
                             already_requested = true;
                             break;
                         }
@@ -91,9 +82,9 @@ Block PieceManager::GetNextBlockToDownload(const std::vector<bool> &peer_bitfiel
 
                     if (!already_requested) {
                         Block ans;
-                        ans.index_ = pieces_[i].id_;
+                        ans.index_ = piece.id_;
                         ans.begin_ = begin;
-                        ans.length_ = std::min(pieces_[i].total_size_ - ans.begin_, static_cast<size_t>(1 << 14));
+                        ans.length_ = std::min(piece.total_size_ - ans.begin_, static_cast<size_t>(1 << 14));
                         return ans;
                     }
                 }
@@ -135,11 +126,7 @@ void PieceManager::SetDownloaded(size_t id) {
     }
     pieces_[id].state_ = Piece::DOWNLOADED;
 
-    auto it = std::find(downloading_pieces_.begin(), downloading_pieces_.end(), id);
-    if (it != downloading_pieces_.end()) {
-        std::swap(*it, downloading_pieces_.back());
-        downloading_pieces_.pop_back();
-    }
+    downloading_pieces_.Reset(id);
 }
 
 void PieceManager::ResetPiece(size_t id) {
@@ -149,14 +136,8 @@ void PieceManager::ResetPiece(size_t id) {
     }
     pieces_[id].ResetPiece();
 
-    auto it = std::find(downloading_pieces_.begin(), downloading_pieces_.end(), id);
-    if (it != downloading_pieces_.end()) {
-        std::swap(*it, downloading_pieces_.back());
-        downloading_pieces_.pop_back();
-    }
-
-    if (std::find(missing_pieces_.begin(), missing_pieces_.end(), id) == missing_pieces_.end())
-        missing_pieces_.push_back(id);
+    downloading_pieces_.Reset(id);
+    missing_pieces_.Set(id);
 }
 
 void PieceManager::SetSaved(size_t id) {
@@ -181,7 +162,8 @@ size_t PieceManager::TotalPiecesToDownload() const {
 }
 
 
-Piece::Piece(size_t id, size_t this_length) : total_size_(this_length), id_(id) {
+Piece::Piece(size_t id, size_t this_length, dynamic_bitset &down) :
+        total_size_(this_length), id_(id), downloading_pieces_(down) {
     size_t offset = 0, total_blocks = total_size_ / (1 << 14);
 
     if (total_blocks * (1 << 14) < total_size_) ++total_blocks;
@@ -221,7 +203,13 @@ void Piece::ResetBlock(size_t offset) {
 
     if (find(not_downloaded_begins_.begin(), not_downloaded_begins_.end(), offset) == not_downloaded_begins_.end())
         not_downloaded_begins_.emplace_back(offset);
-    downloaded_[offset >> 14] = false;
+
+    if (downloaded_[offset >> 14]) {
+        downloaded_[offset >> 14] = false;
+        --blocks_downloaded;
+    }
+
+    downloading_pieces_.Set(id_);
 }
 
 void Piece::ResetPiece() {
@@ -257,6 +245,9 @@ Block Piece::GetNextBlock() {
     ans.begin_ = not_downloaded_begins_.back();
     ans.length_ = std::min(total_size_ - ans.begin_, static_cast<size_t>(1 << 14));
     not_downloaded_begins_.pop_back();
+
+    if (not_downloaded_begins_.empty()) downloading_pieces_.Reset(id_);
+
     return ans;
 }
 

@@ -85,7 +85,6 @@ private:
     int fd_ = -1;
     bool is_choked_ = true;
     bool sent_interest = false;
-    std::vector<bool> peer_bitfield_;
     State state_ = CONNECTING;
     Peer peer_;
     size_t current_offset_ = 0;
@@ -95,4 +94,5 @@ private:
     IoContext read_ctx_;
     IoContext write_ctx_;
     PieceManager &pieceManager_;
+    dynamic_bitset peer_bitfield_;
 };
